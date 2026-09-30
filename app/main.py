@@ -1,3 +1,4 @@
+import re
 from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import Annotated
@@ -14,6 +15,115 @@ from app.database import get_db, initialize_database
 DbDep = Annotated[Session, Depends(get_db)]
 
 
+def _to_float(value: str) -> float | None:
+    cleaned = value.replace("**", "").replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    return float(match.group(0)) if match else None
+
+
+def _extract_summary(text: str) -> str | None:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(("#", "|")):
+            continue
+        return line
+    return None
+
+
+def _extract_forecast_points_from_markdown(text: str) -> list[schemas.ForecastPoint]:
+    lines = [line.strip() for line in text.splitlines() if line.strip().startswith("|")]
+    if len(lines) < 3:
+        return []
+
+    headers = [cell.strip().lower() for cell in lines[0].strip("|").split("|")]
+
+    date_idx = next((i for i, h in enumerate(headers) if "date" in h), None)
+    demand_idx = next((i for i, h in enumerate(headers) if "predicted" in h), None)
+    ci_idx = next((i for i, h in enumerate(headers) if "confidence" in h or "interval" in h), None)
+
+    if date_idx is None or demand_idx is None:
+        return []
+
+    points: list[schemas.ForecastPoint] = []
+    for row in lines[2:]:
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        if max(date_idx, demand_idx) >= len(cells):
+            continue
+
+        date_value = cells[date_idx].replace("**", "").strip()
+        if not date_value or "total" in date_value.lower():
+            continue
+
+        demand_value = _to_float(cells[demand_idx])
+        if demand_value is None:
+            continue
+
+        lower_bound = None
+        upper_bound = None
+        if ci_idx is not None and ci_idx < len(cells):
+            ci_numbers = re.findall(r"-?\d+(?:\.\d+)?", cells[ci_idx].replace(",", ""))
+            if len(ci_numbers) >= 2:
+                lower_bound = float(ci_numbers[0])
+                upper_bound = float(ci_numbers[1])
+
+        points.append(
+            schemas.ForecastPoint(
+                date=date_value,
+                predicted_demand_units=demand_value,
+                lower_bound=lower_bound,
+                upper_bound=upper_bound,
+            )
+        )
+
+    return points
+
+
+def _resolve_agent_base_url() -> str | None:
+    if settings.agent_base_url:
+        return settings.agent_base_url.rstrip("/")
+
+    if not settings.agent_chat_url:
+        return None
+
+    chat_url = settings.agent_chat_url.rstrip("/")
+    for suffix in ("/errortriage/chat", "/chat"):
+        if chat_url.endswith(suffix):
+            return chat_url[: -len(suffix)]
+    return chat_url
+
+
+def _agent_headers() -> dict[str, str]:
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if settings.agent_auth_token:
+        headers[settings.agent_auth_header] = settings.agent_auth_token
+    return headers
+
+
+def _post_agent_json(url: str, payload: dict) -> dict:
+    try:
+        response = httpx.post(
+            url,
+            json=payload,
+            headers=_agent_headers(),
+            timeout=settings.agent_timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Agent call failed: {exc}") from exc
+
+
+def _resolve_refresh_url() -> str | None:
+    if settings.agent_refresh:
+        return settings.agent_refresh.strip()
+    base_url = _resolve_agent_base_url()
+    if not base_url:
+        return None
+    return f"{base_url}/errortriage/refresh_graph"
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
@@ -26,6 +136,29 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/agent/chat", status_code=status.HTTP_200_OK)
+def agent_chat(payload: schemas.AgentChatRequest) -> dict:
+    base_url = _resolve_agent_base_url()
+    if not base_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="CHAT_BACKEND_AGENT_BASE_URL or CHAT_BACKEND_AGENT_CHAT_URL is not configured",
+        )
+    target = f"{base_url}/errortriage/chat"
+    return _post_agent_json(target, payload.model_dump(exclude_none=True))
+
+
+@app.post("/agent/refresh_agent", status_code=status.HTTP_200_OK)
+def refresh_agent(payload: schemas.AgentRefreshRequest) -> dict:
+    refresh_url = _resolve_refresh_url()
+    if not refresh_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="CHAT_BACKEND_AGENT_REFRESH, CHAT_BACKEND_AGENT_BASE_URL or CHAT_BACKEND_AGENT_CHAT_URL is not configured",
+        )
+    return _post_agent_json(refresh_url, payload.payload)
 
 
 @app.post("/v1/sessions", response_model=schemas.SessionRead, status_code=status.HTTP_201_CREATED)
@@ -183,6 +316,9 @@ def chat(payload: schemas.ChatTurnRequest, db: DbDep) -> schemas.ChatTurnRespons
         or agent_body.get("message")
         or agent_body
     )
+    summary = _extract_summary(assistant_text)
+    chart_points = _extract_forecast_points_from_markdown(assistant_text)
+    chart = schemas.ForecastChart(points=chart_points) if chart_points else None
     assistant_message = crud.create_message(
         db,
         session.id,
@@ -206,4 +342,12 @@ def chat(payload: schemas.ChatTurnRequest, db: DbDep) -> schemas.ChatTurnRespons
         ),
     )
 
-    return schemas.ChatTurnResponse(session_id=session.id, reply=assistant_text, latency_ms=latency_ms)
+    payload_dict = agent_body if isinstance(agent_body, dict) else None
+    return schemas.ChatTurnResponse(
+        session_id=session.id,
+        reply=assistant_text,
+        latency_ms=latency_ms,
+        summary=summary,
+        chart=chart,
+        agent_payload=payload_dict,
+    )

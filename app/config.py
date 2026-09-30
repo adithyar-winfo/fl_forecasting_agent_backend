@@ -34,7 +34,9 @@ class Settings(BaseSettings):
     app_name: str = "FL Agent Chat Backend"
     database_url: str = _default_database_url()
     database_schema: str = "fl"
+    agent_base_url: str | None = None
     agent_chat_url: str | None = None
+    agent_refresh: str | None = None
     agent_auth_header: str = "Authorization"
     agent_auth_token: str | None = None
     agent_timeout_seconds: float = 120.0

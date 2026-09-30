@@ -81,7 +81,33 @@ class ChatTurnRequest(BaseModel):
     message: str = Field(min_length=1)
 
 
+class AgentChatRequest(BaseModel):
+    session_id: str | None = None
+    message: str = Field(min_length=1)
+
+
+class AgentRefreshRequest(BaseModel):
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ForecastPoint(BaseModel):
+    date: str
+    predicted_demand_units: float
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+
+
+class ForecastChart(BaseModel):
+    chart_type: Literal["line"] = "line"
+    x_field: str = "date"
+    y_field: str = "predicted_demand_units"
+    points: list[ForecastPoint]
+
+
 class ChatTurnResponse(BaseModel):
     session_id: str
     reply: str
     latency_ms: int
+    summary: str | None = None
+    chart: ForecastChart | None = None
+    agent_payload: dict[str, Any] | None = None

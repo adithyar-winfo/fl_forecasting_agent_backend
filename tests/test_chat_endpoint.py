@@ -49,3 +49,71 @@ def test_chat_endpoint_persists_and_returns_agent_response(monkeypatch) -> None:
         assert len(msgs) == 2
         assert msgs[0]["role"] == "user"
         assert msgs[1]["role"] == "assistant"
+
+
+def test_agent_chat_proxies_to_errortriage_chat(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "agent_base_url", "https://agent.example.com")
+
+    called = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict:
+            return {"ok": True}
+
+    def _fake_post(*args, **kwargs):
+        called["url"] = args[0]
+        called["json"] = kwargs.get("json")
+        return _Resp()
+
+    monkeypatch.setattr("httpx.post", _fake_post)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/agent/chat",
+            json={"session_id": "sess-1", "message": "hello"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        assert called["url"] == "https://agent.example.com/errortriage/chat"
+        assert called["json"] == {"session_id": "sess-1", "message": "hello"}
+
+
+def test_agent_refresh_proxies_to_refresh_graph(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "agent_base_url", "https://agent.example.com")
+
+    called = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict:
+            return {"status": "refreshed"}
+
+    def _fake_post(*args, **kwargs):
+        called["url"] = args[0]
+        called["json"] = kwargs.get("json")
+        return _Resp()
+
+    monkeypatch.setattr("httpx.post", _fake_post)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/agent/refresh_agent",
+            json={"payload": {"module_name": "errortriage"}},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "refreshed"}
+        assert called["url"] == "https://agent.example.com/errortriage/refresh_graph"
+        assert called["json"] == {"module_name": "errortriage"}

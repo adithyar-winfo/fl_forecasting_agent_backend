@@ -11,7 +11,7 @@ from app.main import app
 from app.config import settings
 
 
-def test_chat_endpoint_persists_and_returns_agent_response(monkeypatch) -> None:
+def test_agent_chat_persists_and_returns_agent_response(monkeypatch) -> None:
     monkeypatch.setattr(settings, "agent_chat_url", "https://agent.example.com/chat")
 
     class _Resp:
@@ -33,7 +33,7 @@ def test_chat_endpoint_persists_and_returns_agent_response(monkeypatch) -> None:
     Base.metadata.create_all(bind=engine)
     with TestClient(app) as client:
         resp = client.post(
-            "/chat",
+            "/agent/chat",
             json={
                 "message": "What labor is needed for DC01 tomorrow?",
             },
@@ -51,10 +51,8 @@ def test_chat_endpoint_persists_and_returns_agent_response(monkeypatch) -> None:
         assert msgs[1]["role"] == "assistant"
 
 
-def test_agent_chat_proxies_to_errortriage_chat(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "agent_base_url", "https://agent.example.com")
-
-    called = {}
+def test_agent_chat_uses_provided_session_id(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "agent_chat_url", "https://agent.example.com/chat")
 
     class _Resp:
         status_code = 200
@@ -65,29 +63,24 @@ def test_agent_chat_proxies_to_errortriage_chat(monkeypatch) -> None:
 
         @staticmethod
         def json() -> dict:
-            return {"ok": True}
+            return {"response": "ok"}
 
     def _fake_post(*args, **kwargs):
-        called["url"] = args[0]
-        called["json"] = kwargs.get("json")
         return _Resp()
 
     monkeypatch.setattr("httpx.post", _fake_post)
 
+    Base.metadata.create_all(bind=engine)
     with TestClient(app) as client:
         resp = client.post(
             "/agent/chat",
             json={"session_id": "sess-1", "message": "hello"},
         )
-        assert resp.status_code == 200
-        assert resp.json() == {"ok": True}
-        assert called["url"] == "https://agent.example.com/errortriage/chat"
-        assert called["json"] == {"session_id": "sess-1", "message": "hello"}
+        assert resp.status_code == 201
+        assert resp.json()["session_id"] == "sess-1"
 
 
-def test_agent_refresh_proxies_to_refresh_graph(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "agent_base_url", "https://agent.example.com")
-
+def test_agent_refresh_proxies_to_fixed_refresh_graph_url(monkeypatch) -> None:
     called = {}
 
     class _Resp:
@@ -104,16 +97,17 @@ def test_agent_refresh_proxies_to_refresh_graph(monkeypatch) -> None:
     def _fake_post(*args, **kwargs):
         called["url"] = args[0]
         called["json"] = kwargs.get("json")
+        called["headers"] = kwargs.get("headers")
         return _Resp()
 
     monkeypatch.setattr("httpx.post", _fake_post)
 
     with TestClient(app) as client:
-        resp = client.post(
-            "/agent/refresh_agent",
-            json={"payload": {"module_name": "errortriage"}},
-        )
+        resp = client.post("/agent/refresh_agent")
         assert resp.status_code == 200
         assert resp.json() == {"status": "refreshed"}
-        assert called["url"] == "https://agent.example.com/errortriage/refresh_graph"
-        assert called["json"] == {"module_name": "errortriage"}
+        assert called["url"] == (
+            "https://adithya-ramesh-winfosolut-c67622.graysand-97adfa6b.eastus.azurecontainerapps.io"
+            "/errortriage/refresh_graph"
+        )
+        assert called["json"] == {}

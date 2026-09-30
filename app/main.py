@@ -118,7 +118,11 @@ def chat(payload: schemas.ChatTurnRequest, db: DbDep) -> schemas.ChatTurnRespons
     if payload.session_id:
         session = crud.get_session(db, payload.session_id)
         if not session:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+            session = crud.create_session_with_id(
+                db,
+                payload.session_id,
+                schemas.SessionCreate(title=payload.message[:80]),
+            )
     if not session:
         session = crud.create_session(
             db,

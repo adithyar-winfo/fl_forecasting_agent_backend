@@ -12,6 +12,14 @@ def create_session(db: Session, payload: schemas.SessionCreate) -> models.ChatSe
     return item
 
 
+def create_session_with_id(db: Session, session_id: str, payload: schemas.SessionCreate) -> models.ChatSession:
+    item = models.ChatSession(id=session_id, **payload.model_dump())
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
 def list_sessions(db: Session, user_id: str | None, limit: int, offset: int) -> list[models.ChatSession]:
     stmt = select(models.ChatSession).order_by(models.ChatSession.created_at.desc())
     if user_id:

@@ -1,5 +1,5 @@
-import re
 from contextlib import asynccontextmanager
+import re
 from time import perf_counter
 from typing import Annotated
 
@@ -13,6 +13,7 @@ from app.database import get_db, initialize_database
 
 
 DbDep = Annotated[Session, Depends(get_db)]
+REFRESH_GRAPH_URL = "https://adithya-ramesh-winfosolut-c67622.graysand-97adfa6b.eastus.azurecontainerapps.io/errortriage/refresh_graph"
 
 
 def _to_float(value: str) -> float | None:
@@ -80,20 +81,6 @@ def _extract_forecast_points_from_markdown(text: str) -> list[schemas.ForecastPo
     return points
 
 
-def _resolve_agent_base_url() -> str | None:
-    if settings.agent_base_url:
-        return settings.agent_base_url.rstrip("/")
-
-    if not settings.agent_chat_url:
-        return None
-
-    chat_url = settings.agent_chat_url.rstrip("/")
-    for suffix in ("/errortriage/chat", "/chat"):
-        if chat_url.endswith(suffix):
-            return chat_url[: -len(suffix)]
-    return chat_url
-
-
 def _agent_headers() -> dict[str, str]:
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if settings.agent_auth_token:
@@ -115,15 +102,6 @@ def _post_agent_json(url: str, payload: dict) -> dict:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Agent call failed: {exc}") from exc
 
 
-def _resolve_refresh_url() -> str | None:
-    if settings.agent_refresh:
-        return settings.agent_refresh.strip()
-    base_url = _resolve_agent_base_url()
-    if not base_url:
-        return None
-    return f"{base_url}/errortriage/refresh_graph"
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
@@ -138,27 +116,122 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/agent/chat", status_code=status.HTTP_200_OK)
-def agent_chat(payload: schemas.AgentChatRequest) -> dict:
-    base_url = _resolve_agent_base_url()
-    if not base_url:
+@app.post("/agent/chat", response_model=schemas.ChatTurnResponse, status_code=status.HTTP_201_CREATED)
+def agent_chat(payload: schemas.AgentChatRequest, db: DbDep) -> schemas.ChatTurnResponse:
+    if not settings.agent_chat_url:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="CHAT_BACKEND_AGENT_BASE_URL or CHAT_BACKEND_AGENT_CHAT_URL is not configured",
+            detail="CHAT_BACKEND_AGENT_CHAT_URL is not configured",
         )
-    target = f"{base_url}/errortriage/chat"
-    return _post_agent_json(target, payload.model_dump(exclude_none=True))
+
+    # Resolve or create session first so every chat turn is persisted.
+    session = None
+    if payload.session_id:
+        session = crud.get_session(db, payload.session_id)
+        if not session:
+            session = crud.create_session_with_id(
+                db,
+                payload.session_id,
+                schemas.SessionCreate(title=payload.message[:80]),
+            )
+    if not session:
+        session = crud.create_session(
+            db,
+            schemas.SessionCreate(
+                title=payload.message[:80],
+            ),
+        )
+
+    user_message = crud.create_message(
+        db,
+        session.id,
+        schemas.MessageCreate(
+            role="user",
+            message_type="chat_request",
+            content=payload.message,
+            request_payload={"message": payload.message},
+        ),
+    )
+
+    outbound_payload = {
+        "session_id": session.id,
+        "message": payload.message,
+    }
+
+    headers = _agent_headers()
+
+    started = perf_counter()
+    try:
+        response = httpx.post(
+            settings.agent_chat_url,
+            json=outbound_payload,
+            headers=headers,
+            timeout=settings.agent_timeout_seconds,
+        )
+        response.raise_for_status()
+        agent_body = response.json()
+        status_text = "ok"
+    except Exception as exc:
+        latency_ms = int((perf_counter() - started) * 1000)
+        crud.create_event(
+            db,
+            session.id,
+            schemas.EventCreate(
+                message_id=user_message.id,
+                event_type="agent_chat_call",
+                status="failed",
+                details={"error": str(exc), "agent_url": settings.agent_chat_url, "latency_ms": latency_ms},
+            ),
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Agent call failed: {exc}") from exc
+
+    latency_ms = int((perf_counter() - started) * 1000)
+    assistant_text = str(
+        agent_body.get("response")
+        or agent_body.get("answer")
+        or agent_body.get("message")
+        or agent_body
+    )
+    summary = _extract_summary(assistant_text)
+    chart_points = _extract_forecast_points_from_markdown(assistant_text)
+    chart = schemas.ForecastChart(points=chart_points) if chart_points else None
+    assistant_message = crud.create_message(
+        db,
+        session.id,
+        schemas.MessageCreate(
+            role="assistant",
+            message_type="chat_response",
+            content=assistant_text,
+            response_payload=agent_body,
+            latency_ms=latency_ms,
+        ),
+    )
+
+    crud.create_event(
+        db,
+        session.id,
+        schemas.EventCreate(
+            message_id=assistant_message.id,
+            event_type="agent_chat_call",
+            status=status_text,
+            details={"agent_url": settings.agent_chat_url, "http_status": response.status_code, "latency_ms": latency_ms},
+        ),
+    )
+
+    payload_dict = agent_body if isinstance(agent_body, dict) else None
+    return schemas.ChatTurnResponse(
+        session_id=session.id,
+        reply=assistant_text,
+        latency_ms=latency_ms,
+        summary=summary,
+        chart=chart,
+        agent_payload=payload_dict,
+    )
 
 
 @app.post("/agent/refresh_agent", status_code=status.HTTP_200_OK)
-def refresh_agent(payload: schemas.AgentRefreshRequest) -> dict:
-    refresh_url = _resolve_refresh_url()
-    if not refresh_url:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="CHAT_BACKEND_AGENT_REFRESH, CHAT_BACKEND_AGENT_BASE_URL or CHAT_BACKEND_AGENT_CHAT_URL is not configured",
-        )
-    return _post_agent_json(refresh_url, payload.payload)
+def refresh_agent() -> dict:
+    return _post_agent_json(REFRESH_GRAPH_URL, {})
 
 
 @app.post("/v1/sessions", response_model=schemas.SessionRead, status_code=status.HTTP_201_CREATED)
@@ -238,116 +311,3 @@ def list_events(
     return crud.list_events(db, session_id, limit, offset)
 
 
-@app.post("/chat", response_model=schemas.ChatTurnResponse, status_code=status.HTTP_201_CREATED)
-def chat(payload: schemas.ChatTurnRequest, db: DbDep) -> schemas.ChatTurnResponse:
-    if not settings.agent_chat_url:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="CHAT_BACKEND_AGENT_CHAT_URL is not configured",
-        )
-
-    # Resolve or create session first so every chat turn is persisted.
-    session = None
-    if payload.session_id:
-        session = crud.get_session(db, payload.session_id)
-        if not session:
-            session = crud.create_session_with_id(
-                db,
-                payload.session_id,
-                schemas.SessionCreate(title=payload.message[:80]),
-            )
-    if not session:
-        session = crud.create_session(
-            db,
-            schemas.SessionCreate(
-                title=payload.message[:80],
-            ),
-        )
-
-    user_message = crud.create_message(
-        db,
-        session.id,
-        schemas.MessageCreate(
-            role="user",
-            message_type="chat_request",
-            content=payload.message,
-            request_payload={"message": payload.message},
-        ),
-    )
-
-    outbound_payload = {
-        "session_id": session.id,
-        "message": payload.message,
-    }
-
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if settings.agent_auth_token:
-        headers[settings.agent_auth_header] = settings.agent_auth_token
-
-    started = perf_counter()
-    try:
-        response = httpx.post(
-            settings.agent_chat_url,
-            json=outbound_payload,
-            headers=headers,
-            timeout=settings.agent_timeout_seconds,
-        )
-        response.raise_for_status()
-        agent_body = response.json()
-        status_text = "ok"
-    except Exception as exc:
-        latency_ms = int((perf_counter() - started) * 1000)
-        crud.create_event(
-            db,
-            session.id,
-            schemas.EventCreate(
-                message_id=user_message.id,
-                event_type="agent_chat_call",
-                status="failed",
-                details={"error": str(exc), "agent_url": settings.agent_chat_url, "latency_ms": latency_ms},
-            ),
-        )
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Agent call failed: {exc}") from exc
-
-    latency_ms = int((perf_counter() - started) * 1000)
-    assistant_text = str(
-        agent_body.get("response")
-        or agent_body.get("answer")
-        or agent_body.get("message")
-        or agent_body
-    )
-    summary = _extract_summary(assistant_text)
-    chart_points = _extract_forecast_points_from_markdown(assistant_text)
-    chart = schemas.ForecastChart(points=chart_points) if chart_points else None
-    assistant_message = crud.create_message(
-        db,
-        session.id,
-        schemas.MessageCreate(
-            role="assistant",
-            message_type="chat_response",
-            content=assistant_text,
-            response_payload=agent_body,
-            latency_ms=latency_ms,
-        ),
-    )
-
-    crud.create_event(
-        db,
-        session.id,
-        schemas.EventCreate(
-            message_id=assistant_message.id,
-            event_type="agent_chat_call",
-            status=status_text,
-            details={"agent_url": settings.agent_chat_url, "http_status": response.status_code, "latency_ms": latency_ms},
-        ),
-    )
-
-    payload_dict = agent_body if isinstance(agent_body, dict) else None
-    return schemas.ChatTurnResponse(
-        session_id=session.id,
-        reply=assistant_text,
-        latency_ms=latency_ms,
-        summary=summary,
-        chart=chart,
-        agent_payload=payload_dict,
-    )

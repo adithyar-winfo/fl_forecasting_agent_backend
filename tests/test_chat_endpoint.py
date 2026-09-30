@@ -97,6 +97,7 @@ def test_agent_refresh_proxies_to_fixed_refresh_graph_url(monkeypatch) -> None:
     def _fake_post(*args, **kwargs):
         called["url"] = args[0]
         called["json"] = kwargs.get("json")
+        called["content"] = kwargs.get("content")
         called["headers"] = kwargs.get("headers")
         return _Resp()
 
@@ -110,4 +111,5 @@ def test_agent_refresh_proxies_to_fixed_refresh_graph_url(monkeypatch) -> None:
             "https://adithya-ramesh-winfosolut-c67622.graysand-97adfa6b.eastus.azurecontainerapps.io"
             "/errortriage/refresh_graph"
         )
-        assert called["json"] == {}
+        assert called["json"] is None
+        assert called["content"] == b""

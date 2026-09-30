@@ -102,6 +102,23 @@ def _post_agent_json(url: str, payload: dict) -> dict:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Agent call failed: {exc}") from exc
 
 
+def _post_agent_empty(url: str) -> dict:
+    try:
+        headers = {"accept": "*/*"}
+        if settings.agent_auth_token:
+            headers[settings.agent_auth_header] = settings.agent_auth_token
+        response = httpx.post(
+            url,
+            content=b"",
+            headers=headers,
+            timeout=settings.agent_timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Agent call failed: {exc}") from exc
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
@@ -231,7 +248,7 @@ def agent_chat(payload: schemas.AgentChatRequest, db: DbDep) -> schemas.ChatTurn
 
 @app.post("/agent/refresh_agent", status_code=status.HTTP_200_OK)
 def refresh_agent() -> dict:
-    return _post_agent_json(REFRESH_GRAPH_URL, {})
+    return _post_agent_empty(REFRESH_GRAPH_URL)
 
 
 @app.post("/v1/sessions", response_model=schemas.SessionRead, status_code=status.HTTP_201_CREATED)

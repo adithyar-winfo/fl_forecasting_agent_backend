@@ -11,11 +11,27 @@ Standalone backend for storing chatbot sessions and responses for forecasting/la
 
 ```bash
 cd chat_backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8010
+uv venv
+uv pip install -r requirements.txt
+uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8010
 ```
 
 Open docs: http://127.0.0.1:8010/docs
+
+## Deploy on Render
+
+Use this as your **Start Command**:
+
+```bash
+uv run uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+Why this works:
+- Render requires the app to listen on `0.0.0.0` (not `127.0.0.1`).
+- Render injects the correct runtime port via `$PORT`.
+
+Recommended health check path:
+- `/health`
 
 ## Configuration
 Set environment variables (optional):

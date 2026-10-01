@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
+from datetime import date, timedelta
+import logging
 import re
-from time import perf_counter
+from time import perf_counter, strptime
 from typing import Annotated
 
 import httpx
@@ -14,6 +16,7 @@ from app.database import get_db, initialize_database
 
 DbDep = Annotated[Session, Depends(get_db)]
 REFRESH_GRAPH_URL = "https://adithya-ramesh-winfosolut-c67622.graysand-97adfa6b.eastus.azurecontainerapps.io/errortriage/refresh_graph"
+logger = logging.getLogger(__name__)
 
 
 def _to_float(value: str) -> float | None:
@@ -182,6 +185,89 @@ def _extract_chart_data_from_markdown(text: str) -> dict[str, object] | None:
                 "measure": headers[forecast_idx],
                 "series": series,
             }
+
+    # Labor daily fallback from summary table + date range in narrative.
+    def _extract_date_range(msg: str) -> tuple[date, date] | None:
+        m = re.search(
+            r"spanning\s+([A-Za-z]+\s+\d{1,2},\s*\d{4})\s+through\s+([A-Za-z]+\s+\d{1,2},\s*\d{4})",
+            msg,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+        start_raw, end_raw = m.group(1).strip(), m.group(2).strip()
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                s = strptime(start_raw, fmt)
+                e = strptime(end_raw, fmt)
+                start_dt = date(s.tm_year, s.tm_mon, s.tm_mday)
+                end_dt = date(e.tm_year, e.tm_mon, e.tm_mday)
+                if end_dt >= start_dt:
+                    return start_dt, end_dt
+            except ValueError:
+                continue
+        return None
+
+    date_range = _extract_date_range(text)
+    if date_range is not None:
+        start_dt, end_dt = date_range
+        all_dates: list[str] = []
+        current = start_dt
+        while current <= end_dt:
+            all_dates.append(current.isoformat())
+            current += timedelta(days=1)
+
+        for headers, rows in tables:
+            lower = [h.lower() for h in headers]
+            process_idx = next((i for i, h in enumerate(lower) if "process" in h), None)
+            avg_idx = next((i for i, h in enumerate(lower) if "avg daily labor" in h), None)
+            if process_idx is None or avg_idx is None:
+                continue
+
+            process_values: list[tuple[str, float]] = []
+            for cells in rows:
+                if max(process_idx, avg_idx) >= len(cells):
+                    continue
+                process = cells[process_idx].replace("**", "").strip()
+                if not process:
+                    continue
+                if _is_total_row(cells):
+                    continue
+                avg_value = _to_float(cells[avg_idx])
+                if avg_value is None:
+                    continue
+                process_values.append((process, avg_value))
+
+            if process_values and all_dates:
+                series: list[dict[str, object]] = []
+                for process, avg_value in process_values:
+                    series.append(
+                        {
+                            "name": f"Forecast {process}",
+                            "kind": "forecast",
+                            "line_style": "dot",
+                            "data": [{"date": d, "value": avg_value} for d in all_dates],
+                        }
+                    )
+
+                total_avg = round(sum(v for _, v in process_values), 2)
+                series.append(
+                    {
+                        "name": "Forecast Total",
+                        "kind": "forecast",
+                        "line_style": "solid",
+                        "data": [{"date": d, "value": total_avg} for d in all_dates],
+                    }
+                )
+                return {
+                    "chart_type": "line",
+                    "title": "Labor Forecast (Daily from Summary)",
+                    "x_field": "date",
+                    "y_field": "value",
+                    "granularity": "day",
+                    "measure": "Labor Hours",
+                    "series": series,
+                }
 
     # Labor/category fallback when no date-wise rows are present.
     for headers, rows in tables:
@@ -533,10 +619,23 @@ def agent_chat(payload: schemas.AgentChatRequest, db: DbDep) -> schemas.ChatTurn
     chart_points = _extract_forecast_points_from_markdown(assistant_text)
     chart = schemas.ForecastChart(points=chart_points) if chart_points else None
     chart_data = agent_body.get("chart_data") if isinstance(agent_body, dict) else None
+    chart_source = "upstream"
     if not isinstance(chart_data, dict) and isinstance(agent_body, dict):
         chart_data = _extract_chart_data_from_payload(agent_body)
+        chart_source = "payload" if isinstance(chart_data, dict) else chart_source
     if not isinstance(chart_data, dict):
         chart_data = _extract_chart_data_from_markdown(assistant_text)
+        chart_source = "markdown" if isinstance(chart_data, dict) else "none"
+
+    if isinstance(agent_body, dict):
+        logger.info(
+            "agent_chat chart source=%s upstream_chart=%s payload_keys=%s chart_type=%s series_count=%s",
+            chart_source,
+            isinstance(agent_body.get("chart_data"), dict),
+            sorted(agent_body.keys())[:25],
+            chart_data.get("chart_type") if isinstance(chart_data, dict) else None,
+            len(chart_data.get("series", [])) if isinstance(chart_data, dict) else 0,
+        )
     assistant_message = crud.create_message(
         db,
         session.id,
@@ -652,5 +751,3 @@ def list_events(
     if not crud.get_session(db, session_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     return crud.list_events(db, session_id, limit, offset)
-
-

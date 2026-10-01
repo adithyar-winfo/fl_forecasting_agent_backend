@@ -110,4 +110,5 @@ class ChatTurnResponse(BaseModel):
     latency_ms: int
     summary: str | None = None
     chart: ForecastChart | None = None
+    chart_data: dict[str, Any] | None = None
     agent_payload: dict[str, Any] | None = None

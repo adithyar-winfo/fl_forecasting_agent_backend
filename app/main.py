@@ -212,6 +212,7 @@ def agent_chat(payload: schemas.AgentChatRequest, db: DbDep) -> schemas.ChatTurn
     summary = _extract_summary(assistant_text)
     chart_points = _extract_forecast_points_from_markdown(assistant_text)
     chart = schemas.ForecastChart(points=chart_points) if chart_points else None
+    chart_data = agent_body.get("chart_data") if isinstance(agent_body, dict) else None
     assistant_message = crud.create_message(
         db,
         session.id,
@@ -242,6 +243,7 @@ def agent_chat(payload: schemas.AgentChatRequest, db: DbDep) -> schemas.ChatTurn
         latency_ms=latency_ms,
         summary=summary,
         chart=chart,
+        chart_data=chart_data if isinstance(chart_data, dict) else None,
         agent_payload=payload_dict,
     )
 

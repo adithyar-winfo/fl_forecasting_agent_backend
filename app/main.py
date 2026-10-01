@@ -230,6 +230,143 @@ def _extract_chart_data_from_markdown(text: str) -> dict[str, object] | None:
     return None
 
 
+def _extract_chart_data_from_payload(agent_body: dict) -> dict[str, object] | None:
+    if not isinstance(agent_body, dict):
+        return None
+
+    payload_type = str(agent_body.get("type") or "").lower()
+    records = agent_body.get("datewise_table") or agent_body.get("data")
+    if not isinstance(records, list) or not records:
+        return None
+
+    # Detect date-like field.
+    date_key = None
+    sample_keys = [str(k).lower() for k in records[0].keys()]
+    for candidate in ["date", "forecast_date", "expected_arrival_date"]:
+        if candidate in sample_keys:
+            date_key = candidate
+            break
+    if date_key is None:
+        return None
+
+    def _val(row: dict, *keys: str) -> float | None:
+        lowered = {str(k).lower(): v for k, v in row.items()}
+        for key in keys:
+            if key in lowered:
+                raw = lowered[key]
+                if raw is None:
+                    continue
+                try:
+                    return float(raw)
+                except Exception:
+                    num = _to_float(str(raw))
+                    if num is not None:
+                        return num
+        return None
+
+    # Labor: series by process on date-wise labor hours.
+    if "labor" in payload_type:
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for row in records:
+            if not isinstance(row, dict):
+                continue
+            lower_row = {str(k).lower(): v for k, v in row.items()}
+            date_value = lower_row.get(date_key)
+            process = str(lower_row.get("process") or "Total").strip()
+            if not date_value:
+                continue
+            value = _val(
+                row,
+                "forecast_labor_hours",
+                "required_labor_hours",
+                "adjusted_labor_hours",
+                "daily_labor_hours",
+                "value",
+            )
+            if value is None:
+                continue
+            grouped.setdefault(process, []).append({"date": str(date_value), "value": value})
+
+        if grouped:
+            series = []
+            for process, points in grouped.items():
+                series.append(
+                    {
+                        "name": f"Forecast {process}",
+                        "kind": "forecast",
+                        "line_style": "dot",
+                        "data": points,
+                    }
+                )
+            return {
+                "chart_type": "line",
+                "title": "Labor Forecast Trend by Process",
+                "x_field": "date",
+                "y_field": "value",
+                "granularity": "day",
+                "measure": "Labor Hours",
+                "series": series,
+            }
+
+    # Generic date-wise actual vs forecast line chart.
+    actual_points: list[dict[str, object]] = []
+    forecast_points: list[dict[str, object]] = []
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        lower_row = {str(k).lower(): v for k, v in row.items()}
+        date_value = lower_row.get(date_key)
+        if not date_value:
+            continue
+
+        actual = _val(row, "actual_demand_units", "actual_ordered_qty", "actual", "ordered_qty")
+        forecast = _val(
+            row,
+            "forecast_demand_units",
+            "forecast_received_qty",
+            "predicted_demand_units",
+            "expected_quantity",
+            "forecast",
+            "value",
+        )
+
+        if actual is not None:
+            actual_points.append({"date": str(date_value), "value": actual})
+        if forecast is not None:
+            forecast_points.append({"date": str(date_value), "value": forecast})
+
+    if forecast_points:
+        series: list[dict[str, object]] = []
+        if actual_points:
+            series.append(
+                {
+                    "name": "Actual",
+                    "kind": "actual",
+                    "line_style": "solid",
+                    "data": actual_points,
+                }
+            )
+        series.append(
+            {
+                "name": "Forecast",
+                "kind": "forecast",
+                "line_style": "dot",
+                "data": forecast_points,
+            }
+        )
+        return {
+            "chart_type": "line",
+            "title": "Forecast Trend",
+            "x_field": "date",
+            "y_field": "value",
+            "granularity": "day",
+            "measure": "Forecast",
+            "series": series,
+        }
+
+    return None
+
+
 def _agent_headers() -> dict[str, str]:
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if settings.agent_auth_token:
@@ -362,6 +499,8 @@ def agent_chat(payload: schemas.AgentChatRequest, db: DbDep) -> schemas.ChatTurn
     chart_points = _extract_forecast_points_from_markdown(assistant_text)
     chart = schemas.ForecastChart(points=chart_points) if chart_points else None
     chart_data = agent_body.get("chart_data") if isinstance(agent_body, dict) else None
+    if not isinstance(chart_data, dict) and isinstance(agent_body, dict):
+        chart_data = _extract_chart_data_from_payload(agent_body)
     if not isinstance(chart_data, dict):
         chart_data = _extract_chart_data_from_markdown(assistant_text)
     assistant_message = crud.create_message(

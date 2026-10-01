@@ -241,7 +241,7 @@ def _extract_chart_data_from_payload(agent_body: dict) -> dict[str, object] | No
 
     # Detect date-like field.
     date_key = None
-    sample_keys = [str(k).lower() for k in records[0].keys()]
+    sample_keys = [str(k).lower() for k in records[0]]
     for candidate in ["date", "forecast_date", "expected_arrival_date"]:
         if candidate in sample_keys:
             date_key = candidate
@@ -258,7 +258,7 @@ def _extract_chart_data_from_payload(agent_body: dict) -> dict[str, object] | No
                     continue
                 try:
                     return float(raw)
-                except Exception:
+                except (TypeError, ValueError):
                     num = _to_float(str(raw))
                     if num is not None:
                         return num
@@ -266,6 +266,40 @@ def _extract_chart_data_from_payload(agent_body: dict) -> dict[str, object] | No
 
     # Labor: series by process on date-wise labor hours.
     if "labor" in payload_type:
+        # Preferred labor-wide format: date + process columns (+ Total)
+        total_points: list[dict[str, object]] = []
+        for row in records:
+            if not isinstance(row, dict):
+                continue
+            lower_row = {str(k).lower(): v for k, v in row.items()}
+            date_value = lower_row.get(date_key)
+            if not date_value:
+                continue
+
+            total_value = _val(row, "total", "total_labor", "total_labor_hours")
+            if total_value is None:
+                continue
+            total_points.append({"date": str(date_value), "value": total_value})
+
+        if total_points:
+            return {
+                "chart_type": "line",
+                "title": "Labor Forecast (Daily Total)",
+                "x_field": "date",
+                "y_field": "value",
+                "granularity": "day",
+                "measure": "Labor Hours",
+                "series": [
+                    {
+                        "name": "Forecast Total Labor Hours",
+                        "kind": "forecast",
+                        "line_style": "dot",
+                        "data": total_points,
+                    }
+                ],
+            }
+
+        # Long labor format fallback: date + process + labor metric.
         grouped: dict[str, list[dict[str, object]]] = {}
         for row in records:
             if not isinstance(row, dict):

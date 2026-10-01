@@ -249,16 +249,6 @@ def _extract_chart_data_from_markdown(text: str) -> dict[str, object] | None:
                             "data": [{"date": d, "value": avg_value} for d in all_dates],
                         }
                     )
-
-                total_avg = round(sum(v for _, v in process_values), 2)
-                series.append(
-                    {
-                        "name": "Forecast Total",
-                        "kind": "forecast",
-                        "line_style": "solid",
-                        "data": [{"date": d, "value": total_avg} for d in all_dates],
-                    }
-                )
                 return {
                     "chart_type": "line",
                     "title": "Labor Forecast (Daily from Summary)",
@@ -352,38 +342,50 @@ def _extract_chart_data_from_payload(agent_body: dict) -> dict[str, object] | No
 
     # Labor: series by process on date-wise labor hours.
     if "labor" in payload_type:
-        # Preferred labor-wide format: date + process columns (+ Total)
-        total_points: list[dict[str, object]] = []
-        for row in records:
-            if not isinstance(row, dict):
-                continue
-            lower_row = {str(k).lower(): v for k, v in row.items()}
-            date_value = lower_row.get(date_key)
-            if not date_value:
-                continue
+        # Preferred labor-wide format: date + process columns (exclude Total columns).
+        if records and isinstance(records[0], dict):
+            first_row = {str(k).lower(): k for k in records[0]}
+            process_keys = [
+                original_key
+                for lower_key, original_key in first_row.items()
+                if lower_key not in {date_key, "total", "total_labor", "total_labor_hours"}
+            ]
 
-            total_value = _val(row, "total", "total_labor", "total_labor_hours")
-            if total_value is None:
-                continue
-            total_points.append({"date": str(date_value), "value": total_value})
+            wide_series: list[dict[str, object]] = []
+            for proc_key in process_keys:
+                points: list[dict[str, object]] = []
+                for row in records:
+                    if not isinstance(row, dict):
+                        continue
+                    lower_row = {str(k).lower(): v for k, v in row.items()}
+                    date_value = lower_row.get(date_key)
+                    if not date_value:
+                        continue
+                    value = _val(row, str(proc_key).lower(), str(proc_key))
+                    if value is None:
+                        continue
+                    points.append({"date": str(date_value), "value": value})
 
-        if total_points:
-            return {
-                "chart_type": "line",
-                "title": "Labor Forecast (Daily Total)",
-                "x_field": "date",
-                "y_field": "value",
-                "granularity": "day",
-                "measure": "Labor Hours",
-                "series": [
-                    {
-                        "name": "Forecast Total Labor Hours",
-                        "kind": "forecast",
-                        "line_style": "dot",
-                        "data": total_points,
-                    }
-                ],
-            }
+                if points:
+                    wide_series.append(
+                        {
+                            "name": f"Forecast {proc_key}",
+                            "kind": "forecast",
+                            "line_style": "dot",
+                            "data": points,
+                        }
+                    )
+
+            if wide_series:
+                return {
+                    "chart_type": "line",
+                    "title": "Labor Forecast Trend by Process",
+                    "x_field": "date",
+                    "y_field": "value",
+                    "granularity": "day",
+                    "measure": "Labor Hours",
+                    "series": wide_series,
+                }
 
         # Long labor format fallback: date + process + labor metric.
         grouped: dict[str, list[dict[str, object]]] = {}

@@ -81,6 +81,155 @@ def _extract_forecast_points_from_markdown(text: str) -> list[schemas.ForecastPo
     return points
 
 
+def _extract_markdown_tables(text: str) -> list[tuple[list[str], list[list[str]]]]:
+    lines = [line.strip() for line in text.splitlines()]
+    tables: list[list[str]] = []
+    current: list[str] = []
+
+    for line in lines:
+        if line.startswith("|") and line.endswith("|"):
+            current.append(line)
+        elif current:
+            tables.append(current)
+            current = []
+    if current:
+        tables.append(current)
+
+    parsed: list[tuple[list[str], list[list[str]]]] = []
+    for block in tables:
+        if len(block) < 2:
+            continue
+        rows = [r.strip("|") for r in block]
+        header = [c.strip() for c in rows[0].split("|")]
+
+        data_lines = rows[1:]
+        if data_lines and re.fullmatch(r"\s*:?-+:?\s*(\|\s*:?-+:?\s*)*", data_lines[0]):
+            data_lines = data_lines[1:]
+
+        data_rows = [[c.strip() for c in row.split("|")] for row in data_lines if row.strip()]
+        if not header or not data_rows:
+            continue
+        parsed.append((header, data_rows))
+
+    return parsed
+
+
+def _extract_chart_data_from_markdown(text: str) -> dict[str, object] | None:
+    tables = _extract_markdown_tables(text)
+    if not tables:
+        return None
+
+    def _is_total_row(cells: list[str]) -> bool:
+        joined = " ".join(cells).lower()
+        return bool(re.search(r"\b(total|subtotal|grand\s+total|overall|sum)\b", joined))
+
+    for headers, rows in tables:
+        lower = [h.lower() for h in headers]
+        date_idx = next((i for i, h in enumerate(lower) if "date" in h), None)
+        actual_idx = next((i for i, h in enumerate(lower) if any(k in h for k in ["actual", "ordered", "baseline"])), None)
+        forecast_idx = next((i for i, h in enumerate(lower) if any(k in h for k in ["forecast", "predicted", "expected"])), None)
+
+        if date_idx is None or forecast_idx is None:
+            continue
+
+        forecast_points: list[dict[str, object]] = []
+        actual_points: list[dict[str, object]] = []
+
+        for cells in rows:
+            if max(date_idx, forecast_idx) >= len(cells):
+                continue
+            if _is_total_row(cells):
+                continue
+
+            date_value = cells[date_idx].replace("**", "").strip()
+            if not date_value:
+                continue
+
+            f_val = _to_float(cells[forecast_idx])
+            if f_val is not None:
+                forecast_points.append({"date": date_value, "value": f_val})
+
+            if actual_idx is not None and actual_idx < len(cells):
+                a_val = _to_float(cells[actual_idx])
+                if a_val is not None:
+                    actual_points.append({"date": date_value, "value": a_val})
+
+        if forecast_points:
+            series: list[dict[str, object]] = []
+            if actual_points:
+                series.append(
+                    {
+                        "name": "Actual",
+                        "kind": "actual",
+                        "line_style": "solid",
+                        "data": actual_points,
+                    }
+                )
+            series.append(
+                {
+                    "name": "Forecast",
+                    "kind": "forecast",
+                    "line_style": "dot",
+                    "data": forecast_points,
+                }
+            )
+            return {
+                "chart_type": "line",
+                "title": "Forecast Trend",
+                "x_field": "date",
+                "y_field": "value",
+                "granularity": "day",
+                "measure": headers[forecast_idx],
+                "series": series,
+            }
+
+    # Labor/category fallback when no date-wise rows are present.
+    for headers, rows in tables:
+        lower = [h.lower() for h in headers]
+        category_idx = next((i for i, h in enumerate(lower) if any(k in h for k in ["process", "category", "shift"])), None)
+        value_idx = None
+        for key in ["14-day total labor hours", "daily labor hours", "labor hours", "required daily staffing", "required headcount"]:
+            value_idx = next((i for i, h in enumerate(lower) if key in h), None)
+            if value_idx is not None:
+                break
+        if category_idx is None or value_idx is None:
+            continue
+
+        points: list[dict[str, object]] = []
+        for cells in rows:
+            if max(category_idx, value_idx) >= len(cells):
+                continue
+            if _is_total_row(cells):
+                continue
+            category = cells[category_idx].replace("**", "").strip()
+            if not category:
+                continue
+            value = _to_float(cells[value_idx])
+            if value is None:
+                continue
+            points.append({"category": category, "value": value})
+
+        if points:
+            return {
+                "chart_type": "bar",
+                "title": "Labor Forecast by Category",
+                "x_field": "category",
+                "y_field": "value",
+                "granularity": "category",
+                "measure": headers[value_idx],
+                "series": [
+                    {
+                        "name": headers[value_idx],
+                        "kind": "forecast",
+                        "line_style": "solid",
+                        "data": points,
+                    }
+                ],
+            }
+
+    return None
+
+
 def _agent_headers() -> dict[str, str]:
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if settings.agent_auth_token:
@@ -213,6 +362,8 @@ def agent_chat(payload: schemas.AgentChatRequest, db: DbDep) -> schemas.ChatTurn
     chart_points = _extract_forecast_points_from_markdown(assistant_text)
     chart = schemas.ForecastChart(points=chart_points) if chart_points else None
     chart_data = agent_body.get("chart_data") if isinstance(agent_body, dict) else None
+    if not isinstance(chart_data, dict):
+        chart_data = _extract_chart_data_from_markdown(assistant_text)
     assistant_message = crud.create_message(
         db,
         session.id,
